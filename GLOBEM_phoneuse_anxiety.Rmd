@@ -1,0 +1,726 @@
+---
+title: "Preprocessing_GLOBEM"
+author: "Joe Gyorda"
+date: "2023-03-27"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(stringr)
+library(performance)
+library(lubridate)
+library(rmcorr)
+library(Hmisc)
+library(polycor)
+library(ordinal)
+library(effects)
+library(MASS) # for polr - needed for effects
+library(RColorBrewer)
+```
+
+This codebook contains the code corresponding to the manuscript "Detecting Longitudinal Trends Between Passively-Collected Phone Use and Anxiety among College Students". Data was leveraged from the GLOBEM study with their permission. 
+
+There is a growing body of research linking phone use to anxiety, with many existing theories citing both behavioral addiction and psychological pathway conceptualizations of phone use and anxiety. However, these studies are generally cross-sectional and do not reveal the longitudinal/causal pathways of phone use and how (or how not) it contributes to anxiety. We seek to use the GLOBEM dataset to understand how phone use (assessed via duration of unlock episodes each day) correlates with and predicts PHQ4 anxiety levels. We also seek to investigate the role of location with phone use and anxiety, examining an individual's phone use at home vs away from home.
+
+The code book is organized as follows:
+
+1. Preprocessing -- read in all dataframes
+2. Feature engineering -- create all features to be used in modeling
+3. Visualization and analysis of features 
+4. Model and results -- mixed-effects logistic regression model
+5. Appendix -- contains supplementary code and visuals
+
+\newpage
+
+## 1. Preprocessing
+
+Let's read in the dataset with the PHQ-4 survey results. 
+
+```{r Read in PHQ_4 data}
+setwd('/users/joegyorda/Desktop/Jacobson lab/GLOBEM/')
+
+# read in data from each study wave
+phq_d2 = read_csv('globem-dataset/INS-W_2/SurveyData/ema.csv', show_col_types=F)
+phq_d3 = read_csv('globem-dataset/INS-W_3/SurveyData/ema.csv', show_col_types=F)
+phq_d4 = read_csv('globem-dataset/INS-W_4/SurveyData/ema.csv', show_col_types=F)
+phq_d2$wave = 2; phq_d3$wave = 3; phq_d4$wave = 4
+
+# combine into one dataframe
+phq_all = rbind(phq_d2,phq_d3,phq_d4)
+
+# remove missing values -- we only will consider non-missing PHQ-4 anxiety records 
+phq_all = phq_all[complete.cases(phq_all$phq4_anxiety_EMA),] 
+
+# filter to only the phq4 anxiety data
+phq_all = phq_all %>% 
+  dplyr::select(pid, date, wave, phq4_anxiety_EMA)
+head(phq_all)
+
+# check frequencies for individual IDs
+paste("Person-years:", length(unique(phq_all$pid))) # 607 person-years
+summary(as.numeric(table(phq_all$pid)))
+
+# remove original dataframes to save space
+rm(phq_d2,phq_d3,phq_d4) 
+```
+
+Looking at individual participant IDs, >75% have 10 occurrences (i.e., ~10 weeks) of PHQ-4 records, shown above.
+
+Now, read in the phone use and location data. We subset to features capturing the summed phone unlock duration at the daily level at different locations (home, green space, etc).
+
+First, read in and preprocess the phone usage data. We'll extract daily records pertaining to an individuals summed phone use duration in total and at different locations.
+
+```{r Read in Phone Use Data}
+phone_d2 = read_csv('globem-dataset/INS-W_2/FeatureData/screen.csv', show_col_types=F)
+phone_d3 = read_csv('globem-dataset/INS-W_3/FeatureData/screen.csv', show_col_types=F)
+phone_d4 = read_csv('globem-dataset/INS-W_4/FeatureData/screen.csv', show_col_types=F)
+phone_d2$wave = 2; phone_d3$wave = 3; phone_d4$wave = 4
+phone_all = rbind(phone_d2,phone_d3,phone_d4)
+
+# subset phone use data
+phone_all = phone_all %>%
+  dplyr::select(pid,date,wave,matches('sumdurationunlock')) %>%
+  dplyr::select(pid,date,wave,matches('allday'))
+phone_all = phone_all[,1:9] # remove discretized/normalized features
+
+colnames(phone_all) = c("pid","date","wave","sumdurationunlock","sumdurationunlock_exercise",
+                        "sumdurationunlock_greens","sumdurationunlock_living",
+                        "sumdurationunlock_study","sumdurationunlock_home")
+head(phone_all, 5)
+length(unique(phone_all$pid)) # 550 person-years 
+unique(table(phone_d2$date)) # shows all dates are present! each date occurs 218 times
+
+# remove original dataframes to save space
+rm(phone_d2,phone_d3,phone_d4) 
+```
+
+Note that we have phone use data at many locations, including at green space, while exercising, at home, etc. Let's check the missingness rates for each feature:
+
+```{r Examine missingness a bit in phone data}
+phone_ids = unique(phone_all$pid)
+
+missing_ph = matrix(ncol=6)
+for (id in phone_ids) {
+  sub_data = phone_all[phone_all$pid==id,]
+  missing_ph = rbind(missing_ph, colMeans(is.na(sub_data[,-c(1:3)]))) 
+}
+missing_ph = missing_ph[-1,]
+summary(missing_ph)
+```
+
+The `missing_ph` dataframe examines the per-person missingness rates for each feature. Above, we see that an individual are missing a median of 21.36% of total phone unlock duration records and 27.84% at-home phone unlock duration daily records. While not ideal, note that this doesn't reflect our final sample since we haven't paired the phone use data with PHQ4 records yet. However, because the exercise/green/living/study phone unlock duration records all exhibit high missingness rates (median missingness>90% for each), we will not include these variables in our analyses. We'll only use total daily phone use, daily phone use at home, and daily phone use not at home (calculated below).
+
+Great! Now we'll read in and preprocess the location data, which will tell us how much time an individual spent at different locations. We'll later use this to calculate the proportion of time an individual spent on their phone at each location.
+
+```{r Read in location data}
+location_d2 = read_csv('globem-dataset/INS-W_2/FeatureData/location.csv', show_col_types=F)
+location_d3 = read_csv('globem-dataset/INS-W_3/FeatureData/location.csv', show_col_types=F)
+location_d4 = read_csv('globem-dataset/INS-W_4/FeatureData/location.csv', show_col_types=F)
+location_d2$wave = 2; location_d3$wave = 3; location_d4$wave = 4
+location_all = rbind(location_d2,location_d3,location_d4)
+
+# subset location data
+location_all = location_all %>%
+  dplyr::select('pid','date','wave',matches('allday')) %>%
+  dplyr::select('pid','date','wave',matches(c('timeathome:','hometime:'))) 
+
+colnames(location_all) = c("pid","date","wave","timeathome","hometime")
+head(location_all,5)
+length(unique(location_all$pid)) # 550 person-years
+# unique(table(location_d4$date)) # shows all dates are present!
+
+rm(location_d2,location_d3,location_d4) # don't need these anymore
+```
+
+Next, we'll combine the phone use and location dataframes:
+
+```{r Merge phone/location dataframes}
+# subset columns from phone_all
+phone_all2 = phone_all %>% 
+  dplyr::select(pid, date, wave, sumdurationunlock, sumdurationunlock_home)
+
+# combine phone use data with location data
+phone_loc_all = phone_all2 %>% 
+  inner_join(location_all, by=c("pid"="pid","date"="date","wave"="wave"))
+
+# ensure we only keep phone/loc data for individuals for whom we have PHQ data
+phone_loc_ids = unique(phone_loc_all$pid)
+final_ids = intersect(phone_loc_ids,unique(phq_all$pid))
+phone_loc_all = phone_loc_all[phone_loc_all$pid %in% final_ids,] 
+
+head(phone_loc_all,5)
+```
+
+Let's check out the ranges of dates for which we have phone use & location data: 
+
+```{r check date ranges for each wave}
+# get date ranges - same for location data
+date_range_p2 = range(phone_all$date[phone_all$wave==2])
+date_range_p3 = range(phone_all$date[phone_all$wave==3])
+date_range_p4 = range(phone_all$date[phone_all$wave==4])
+cat(paste("Wave 2 date range: ", date_range_p2[1], '-', date_range_p2[2], 
+          "\nWave 3 date range: ", date_range_p3[1], '-', date_range_p3[2],
+          "\nWave 4 date range: ", date_range_p4[1], '-', date_range_p4[2]))
+```
+
+
+Below, we'll summarize phone usage with the median daily value from the 14 days prior to a PHQ4 record. Here, we'll make sure for each PHQ4 record that there's at least 14 days of phone/location data prior to its collection.
+
+```{r check 14 days of phone_loc data}
+# remove people without phone_loc data
+phq_all = phq_all[phq_all$pid %in% final_ids,]         
+
+# create new dataframe for filtered PHQ records
+phq_all2 = data.frame(matrix(0,ncol=ncol(phq_all))) 
+colnames(phq_all2) = colnames(phq_all)
+phq_all2$date = as.Date(phq_all2$date, origin='1970-01-01')
+
+# filter phq data to make sure each time point has at least 2 weeks of phone_loc data
+for (i in 1:nrow(phq_all)) {
+  sub_data = phq_all[i,]
+  if (sub_data$wave==2) {
+    if ((sub_data$date - 14) >= date_range_p2[1]) phq_all2 = rbind(phq_all2,phq_all[i,])
+  }
+  else if (sub_data$wave==3) {
+    if ((sub_data$date - 14) >= date_range_p3[1]) phq_all2 = rbind(phq_all2,phq_all[i,])
+  }
+  else if (sub_data$wave==4) {
+    if ((sub_data$date - 14) >= date_range_p4[1]) phq_all2 = rbind(phq_all2,phq_all[i,])
+  }
+}
+phq_all2 = phq_all2[-1,]
+
+# update final_ids in case we dropped any participants
+final_ids = unique(phq_all2$pid)
+
+paste("Original number of PHQ4 records:", nrow(phq_all))
+paste("Updated number of PHQ4 records:", nrow(phq_all2))
+paste("Original number of unique IDs:", length(unique(phq_all$pid)))
+paste("New number of unique IDs:", length(unique(phq_all2$pid)))
+```
+
+Great! We'll examine again the number of person-years and distribution of records per ID:
+
+```{r check updated person-years}
+length(unique(phq_all2$pid)) # 547 person-years
+final_ids = unique(phq_all2$pid)
+summary(as.numeric(table(phq_all2$pid))) # more than half of people have >=9 points 
+```
+
+Checking that total unlock duration always greater than home unlock duration - it is!
+
+```{r check duration phone/at home}
+summary(phone_loc_all$sumdurationunlock-phone_loc_all$sumdurationunlock_home)
+```
+
+Also quickly checking the distribution of phone unlock duration values in total/at home. We see that the distributions are right-skewed with a few hundred outliers, suggesting that some individuals are spending the majority of the day with their phones unlocked.
+
+```{r check duration unlock at home/total}
+# 699 outliers, all on high end
+subset(phone_loc_all, phone_loc_all$sumdurationunlock %in% 
+         boxplot(phone_loc_all$sumdurationunlock, horizontal=T, 
+                 xlab='sumdurationunlock')$out)
+
+# 778 outliers, all on high end
+subset(phone_loc_all, phone_loc_all$sumdurationunlock_home %in% 
+         boxplot(phone_loc_all$sumdurationunlock_home, horizontal=T, 
+                 xlab='sumdurationunlock_home')$out)
+```
+\newpage
+
+## 2. Feature engineering
+
+Let's update our phone use variables. We want to create new variables representing the **proportion (0-1)** of time spent on the phone while at different locations. This will make it easier to compare the relationships between phone use/anxiety across different locations and control for day-to-day variation in the amount of time individuals are spending at home/away from home.
+
+First, we found some cases (693) where sumduration_home > timeathome, implying that individuals spent more time on their phones at home than they were actually at home. This is a relatively small subset of the data (2.09%), so to fix this we'll just set the timeathome and sumduration_home equal. This will cause the proportion of time spent on the phone while at home to be 1 for these instances.
+
+```{r fix error in data}
+# code to verify there are 693 cases where sumdurationunlock_home > timeathome
+# phone_loc_all[phone_loc_all$sumdurationunlock_home>phone_loc_all$timeathome,][complete.cases(phone_loc_all[phone_loc_all$sumdurationunlock_home>phone_loc_all$timeathome,]),]
+# nrow(phone_loc_all[complete.cases(phone_loc_all),]) = 33150
+# so 693/33150*100 = 2.09% of cases. Will just set equal (so proportion=1).
+
+phone_loc_all$sumdurationunlock_home = 
+  ifelse(phone_loc_all$sumdurationunlock_home>phone_loc_all$timeathome,
+         phone_loc_all$timeathome, phone_loc_all$sumdurationunlock_home)
+```
+
+To estimate phone use away from home, we'll define the `nottimehome` variable to be the total time in a day (1440 minutes) minus time spent at home. We'll use the same logic to calculate phone use away from home by subtracting phone us at home from total phone use.
+
+```{r Creating time away from home feature}
+# new variables for time not at home and phone use not at home
+phone_loc_all$nottimeathome = 1440 - phone_loc_all$timeathome # 1440 minutes in a day
+phone_loc_all$sumdurationunlock_nothome = phone_loc_all$sumdurationunlock - 
+  phone_loc_all$sumdurationunlock_home
+
+summary(phone_loc_all$nottimeathome) # always positive which is good
+summary(phone_loc_all$sumdurationunlock_nothome) # always positive which is good
+```
+
+We'll now create variables reflecting the daily proportion of time spent on the phone 1) in total, 2) at home, and 3) away from home.
+
+```{r Creating new phone use features}
+# new variable for proportion of total time during day spent on phone
+phone_loc_all$phoneuse_total = phone_loc_all$sumdurationunlock / 1440
+
+# new variables for ratios of phone use at home vs not at home vs total
+phone_loc_all$phoneuse_home = phone_loc_all$sumdurationunlock_home / phone_loc_all$timeathome
+phone_loc_all$phoneuse_nothome = phone_loc_all$sumdurationunlock_nothome / 
+                                  phone_loc_all$nottimeathome 
+
+# some people spend no time at home (0) or all day at home (1440), so remove inf
+# phone_loc_all[is.infinite(phone_loc_all$phoneuse_nothome),]
+phone_loc_all$phoneuse_home[phone_loc_all$timeathome==0]=0
+phone_loc_all$phoneuse_nothome[phone_loc_all$timeathome==1440]=0
+```
+
+Let's examine the distributions of our new features:
+
+```{r new features}
+# summaries of features
+summary(phone_loc_all$phoneuse_total) # max is 0.878
+summary(phone_loc_all$phoneuse_home) # max is now 1!
+summary(phone_loc_all$phoneuse_nothome) # max 0.999
+
+# look at distributions
+boxplot(phone_loc_all$phoneuse_total, phone_loc_all$phoneuse_home, 
+        phone_loc_all$phoneuse_nothome, horizontal=TRUE, 
+        names=c("Total","Home","Not Home"),
+        main="Distribution of Daily Phone Use Proportions at Different Locations",
+        xlab="Proportion (0-1)")
+```
+
+Great! Now we have our raw features for subsequent analysis. In order to pair these with PHQ-4 records, we must obtain the median 14-day values for each phone use feature prior to PHQ-4 assessment.
+
+```{r Now preprocess the PHQ4 into 14-day summaries}
+# want 14-day median for phone use ratios at home, not at home, and total
+# also count the number of NAs from the 14-day window
+phone_loc_binned = NULL
+
+# correspond to columns 6,8,10,11,12
+names_summary = c('timeathome','nottimeathome','phoneuse_total','phoneuse_home','phoneuse_nothome')
+for (id in final_ids) {
+  sub_phone_loc = phone_loc_all[phone_loc_all$pid==id,]
+  sub_phq = phq_all2[phq_all2$pid==id,]
+  for (i in 1:nrow(sub_phq)) {
+    dt = sub_phq$date[i]
+    sub_phone_2 = sub_phone_loc %>% 
+      filter(date>=(dt-14) & date<=(dt-1)) %>% 
+      summarise(across(names_summary, median, na.rm=T, .names = "median_{.col}"),
+                  across(names_summary, ~sum(is.na(.)), .names = "NAcount_{.col}"))
+    final_dat = cbind(sub_phone_loc$pid[1], dt, sub_phone_loc$wave[1], sub_phone_2,sub_phq$phq4_anxiety_EMA[i])
+    phone_loc_binned = rbind(phone_loc_binned,final_dat)
+  }
+}
+
+colnames(phone_loc_binned)[c(1,2,3,14)] = c("pid","date","wave","phq4_anxiety_EMA") 
+
+# remove any remaining missing values -- people with no data in 14-day windows
+all_data_comp = phone_loc_binned[complete.cases(phone_loc_binned),]
+
+head(all_data_comp, 5)
+
+paste("New number of unique IDs:", length(unique(all_data_comp$pid)))
+summary(as.numeric(table(all_data_comp$pid))) # more than half of people have >=9 points 
+```
+
+Excellent, we now have our raw dataset, including the participant ID, date, wave, PHQ-4 anxiety measurement, and our phone use features summarized across 14-day windows prior to each PHQ-4 record.  
+
+Before moving onto modeling, note that some participants were included in multiple waves; however, in the raw GLOBEM dataset, they are assigned a unique ID in each wave. Hence, the '544' sample size we currently have is technically person-years. Upon request, the GLOBEM study coordinators provided supplementary data mapping each participant to a common ID across all waves. Here, I update the participant IDs so that any participant included in multiple waves has the same ID, allowing us to disentangle the relationships between our phone use features and anxiety both within and across study waves. Print statements are included (commented out) for manual debugging/verification.
+
+```{r update IDs}
+# we now have data mapping participant IDs across waves, so we can update the 
+# preprocessed data frame and figure out how many unique individuals we have
+id_mappings = read_csv('PID_mappings.csv', show_col_types=F)
+colnames(id_mappings) = c("pid_2021","pid_2020","pid_2019","pid_2018")
+id_mappings = id_mappings[,c(4,3,2,1)] # reorder columns
+id_mappings = as.data.frame(id_mappings)
+
+# helps if we make sure id_mappings and PID are the same format
+for (i in 1:nrow(all_data_comp)) {
+  all_data_comp$pid[i] = str_split(all_data_comp$pid[i],"_",simplify = TRUE)[2]
+}
+all_data_comp$pid = as.numeric(all_data_comp$pid)
+
+# filter ID mappings to only IDs that are actually in all_data_comp
+id_copies = id_mappings[,2:4]
+unique_ids_maps = unlist(array(id_copies)); unique_ids_maps = unique_ids_maps[!is.na(unique_ids_maps)]
+unique_ids = unique(all_data_comp$pid)
+ids_to_remove = setdiff(unique_ids_maps,unique_ids) # ids in id_mappings not in our data
+
+# set all IDs to remove in id_copies to NA so we know they don't occur in our data
+id_copies[,1][id_copies[,1]%in%ids_to_remove] = NA
+id_copies[,2][id_copies[,2]%in%ids_to_remove] = NA
+id_copies[,3][id_copies[,3]%in%ids_to_remove] = NA
+
+# create copy of ID variable to make it easier to track changes!
+all_data_comp$new_id = all_data_comp$pid 
+all_data_comp = all_data_comp[,c(1,15,2:14)]
+id_copies2 = id_copies # for checking our work later on
+
+# main part - loop thru all IDs in all_data_comp, check which wave the ID
+# belongs to, then if it's in id_mappings, it must have a mapping in another wave
+# so check which wave the mapping is in and update the ID!
+for (id in unique(all_data_comp$pid)) {
+  # wave 2
+  if (id >= 300 & id <= 599) {
+    # print(id)
+    if (id %in% id_copies[,1]) {   # check if ID in wave 2 id_copies
+      i = which(id_copies[,1]==id)
+      if (!is.na(id_copies[i,2])) { # we need to switch the ID in wave 3!
+        replace = id_copies[i,2]
+        # cat(id, replace,"\n")
+        all_data_comp$new_id[all_data_comp$new_id==replace] = id 
+        id_copies2[i,2] = id # update it in copied id_copies
+      }
+      
+      if (!is.na(id_copies[i,3])) {  # we need to switch the ID in wave 4!
+        replace = id_copies[i,3]
+        # cat(id, replace,"\n")
+        all_data_comp$new_id[all_data_comp$new_id==replace] = id 
+        id_copies2[i,3] = id # update it in copied id_copies
+      }
+    }
+  }
+  
+  # wave 3
+  if (id >= 600 & id <= 899) {
+    # print(id)
+    if (id %in% id_copies[,2]) {    # check if ID in wave 3 id_copies
+      i = which(id_copies[,2]==id)
+      if (!is.na(id_copies[i,3]) & is.na(id_copies[i,1])) {  # we need to switch the ID in wave 4!
+        replace = id_copies[i,3]
+        # cat(id, replace,"\n")
+        all_data_comp$new_id[all_data_comp$new_id==replace] = id 
+        id_copies2[i,3] = id # update it in copied id_mappings
+      }
+    } 
+  }
+}
+
+# manually through id_copies2 to make sure each row identical - looks good!
+paste("Number of person-years:", length(unique(all_data_comp$pid)))
+paste("Sample size:", length(unique(all_data_comp$new_id)))
+
+# more than half of people have >=9 points, higher mean now though
+summary(as.numeric(table(all_data_comp$new_id))) 
+```
+
+So we went from 544 person-years to 346 unique participants in our sample. We also see that, across waves, the median number of PHQ-4 records has increased considerably (more than 50% of individuals have >12 records!).
+
+We include Age as an additional demographic feature since, as aforementioned, only some participants are included in multiple waves, so Age and Time are not perfectly correlated and thus cannot be interpreted the same.
+
+```{r preprocess and examine student age}
+age_mappings = read_csv('age_globem.csv', show_col_types=F)
+age_2 = age_mappings[age_mappings$PID %in% all_data_comp$pid,]
+
+# currently missing age for 1225
+# unique(all_data_comp$pid)[!unique(all_data_comp$pid) %in% age_2$PID]  
+
+# add age to dataframe
+all_data_comp2 = all_data_comp %>% 
+  inner_join(age_2,by=c("pid"="PID")) # removes 1225 automatically
+ 
+# drop 1021 for now - no age data, coded as NA
+all_data_comp2 = all_data_comp2 %>% filter(new_id!=1021)
+
+paste("New sample size:", length(unique(all_data_comp2$new_id)))
+paste("Median ages by wave:")
+median(as.numeric(all_data_comp2$age)[all_data_comp2$wave==2])
+median(as.numeric(all_data_comp2$age)[all_data_comp2$wave==3])
+median(as.numeric(all_data_comp2$age)[all_data_comp2$wave==4])
+```
+
+We lost two participants for not having age data. We also see that the median age of participants in each wave is 19-20, suggesting that new (younger) participants were recruited in each wave.
+
+We'll take a quick look at the relationship between time and age in our dataset. We'll define time by setting the earliest point of data collection in Wave 2 as time=0, then each subsequent time point as the number of years since the initial day.  
+
+```{r add in time and age}
+time0 = min(all_data_comp2$date[all_data_comp2$wave==2])
+paste("First date of data collection is", time0)
+
+all_data_comp2$time = lubridate::time_length(all_data_comp2$date - as.Date(time0), "years")
+# all_data_comp2$phq4_anxiety_EMA = ordered(all_data_comp2$phq4_anxiety_EMA)
+
+cor(all_data_comp2$time, all_data_comp2$age, method='spearman') 
+```
+
+The rank-order correlation between Age and Time (0.53) indicates a moderate relationship between the two but not strong, as expected.
+
+We now have our dataset ready for analysis!
+
+\newpage
+
+## 3. Visualization and analysis of features
+
+First, let's examine the missingness in our features:
+
+```{r calcuate missingness in final dataframe}
+# most 14-day windows had no missingness for phone use data!
+paste("Distribution of NA counts per 14 day window:")
+summary(all_data_comp2$NAcount_phoneuse_total)
+summary(all_data_comp2$NAcount_phoneuse_home)
+summary(all_data_comp2$NAcount_phoneuse_nothome)
+
+# 79% of 14-day windows had no missingness for total phone use, but only 53% for phone use away from home
+cat("\nPercent of 14-day windows COMPLETE for each feature\n")
+paste0("Total phone use: ",round(nrow(all_data_comp[all_data_comp2$NAcount_phoneuse_total==0,])
+      /nrow(all_data_comp2)*100,3), "%")
+paste0("Home phone use: ",round(nrow(all_data_comp[all_data_comp2$NAcount_phoneuse_home==0,])
+      /nrow(all_data_comp2)*100,3), "%")
+paste0("Not home phone use: ",round(nrow(all_data_comp[all_data_comp2$NAcount_phoneuse_nothome==0,])
+      /nrow(all_data_comp2)*100,3), "%")
+```
+
+Above, we see that completion rates are overall quite great, with >75% of PHQ-4 records being paired with complete data for total/home phone use, and >53% for not home phone use. 
+
+We'll conduct hypotheses tests to determine whether the values of our features are changing from wave to wave. Summary stats and test results to be included in table in paper.
+
+```{r Hypothesis testing 1}
+# total phone use
+pairwise.wilcox.test(x=all_data_comp2$median_phoneuse_total, g=all_data_comp2$wave)
+summary(all_data_comp2$median_phoneuse_total[all_data_comp2$wave==2])
+summary(all_data_comp2$median_phoneuse_total[all_data_comp2$wave==3])
+summary(all_data_comp2$median_phoneuse_total[all_data_comp2$wave==4])
+```
+
+Total phone use increased from wave 2 to 3-4!
+
+```{r Hypothesis testing 2}
+# phone use home
+pairwise.wilcox.test(x=all_data_comp2$median_phoneuse_home, g=all_data_comp2$wave)
+summary(all_data_comp2$median_phoneuse_home[all_data_comp2$wave==2])
+summary(all_data_comp2$median_phoneuse_home[all_data_comp2$wave==3])
+summary(all_data_comp2$median_phoneuse_home[all_data_comp2$wave==4])
+```
+
+Phone use at home increased from wave 2 to 3-4!
+
+```{r Hypothesis testing 3}
+# phone use not at home
+pairwise.wilcox.test(x=all_data_comp2$median_phoneuse_nothome, g=all_data_comp2$wave)
+summary(all_data_comp2$median_phoneuse_nothome[all_data_comp2$wave==2])
+summary(all_data_comp2$median_phoneuse_nothome[all_data_comp2$wave==3])
+summary(all_data_comp2$median_phoneuse_nothome[all_data_comp2$wave==4])
+```
+
+Phone use away from home dropped from wave 2-3 and then increased from 3-4!
+
+```{r Hypothesis testing 4}
+# age
+pairwise.wilcox.test(x=as.numeric(all_data_comp2$age), g=all_data_comp2$wave)
+summary(as.numeric(all_data_comp2$age)[all_data_comp2$wave==2])
+summary(as.numeric(all_data_comp2$age)[all_data_comp2$wave==3])
+summary(as.numeric(all_data_comp2$age)[all_data_comp2$wave==4])
+```
+
+Age was significantly different across waves, and the stats suggest that participants were slightly older on average from wave to wave.
+
+Let's visualize how anxiety levels change from wave to wave. Note that we bin anxiety levels (originally on 0-6 scale) into four bins (0 - no symptoms; 1-2 - light symptoms; 3-4 - moderate symptoms; 5-6 - severe symptoms) to reduce downstream model complexity and in line with PHQ-4 anxiety subscale interpretation; more detail provided in paper.
+
+```{r Show distribution of anxiety level}
+# rebin anxiety features into four levels
+all_data_comp2$phq4_anxiety_EMA_binned = as.factor(ifelse(all_data_comp2$phq4_anxiety_EMA>=5, 3, 
+                                                         ifelse(all_data_comp2$phq4_anxiety_EMA==0,0,
+                                                                ifelse(all_data_comp2$phq4_anxiety_EMA>=3,2,1))))
+# data for plotting
+df_proportions <- all_data_comp2 %>%
+  group_by(wave, phq4_anxiety_EMA_binned) %>%
+  summarise(n = n()) %>%
+  mutate(proportion = n / sum(n))
+
+df_proportions$phq4_anxiety_EMA_binned <- factor(df_proportions$phq4_anxiety_EMA_binned, 
+                                                 levels = rev(levels(df_proportions$phq4_anxiety_EMA_binned)))
+
+ggplot(df_proportions, aes(x = wave, y = proportion, fill = as.factor(phq4_anxiety_EMA_binned))) +
+  geom_bar(stat = "identity", position='stack') +
+  scale_fill_manual(labels = c("5-6", "3-4", "1-2", "0"),
+                    values = brewer.pal(4,"YlGnBu")) +
+  labs(x = "Time (Year of Study)", y = "Proportion", fill = "Anxiety Level") +
+  geom_text(aes(label = paste0(round(proportion,2))),
+            position = position_stack(vjust = 0.5),
+            color = "black",
+            size = 3) +
+  ggtitle("Distribution of PHQ-4 Anxiety Scores Across Waves")
+```
+
+Overall, the proportion of PHQ-4 records with no anxiety symptoms reported (anxiety level=0) jumped from wave 2 to 3-4. Fewer individuals reported clinically significant (anxiety level >3) symptoms from waves 2-3, then bumped from 3-4.
+
+\newpage
+
+## 4. Models and results
+
+Our outcome is ordinal (four levels, ranked by anxiety severity), and we have observations nested within individuals. We can create an ordinal logistic mixed-effects model:
+
+```{r mixed models}
+# ordinal logistic mixed effects model
+mod1 = clmm(phq4_anxiety_EMA_binned ~ time*median_phoneuse_total + time*median_phoneuse_home
+            + time*median_phoneuse_nothome + age + (time|new_id), data=all_data_comp2,
+            method="nlminb", link='logit') # , control = list(method = "Nelder-Mead")
+
+r2(mod1)
+summary(mod1)
+```
+
+At the p=0.05 level, we see that median_phoneuse_total and time*median_phoneuse_total are both signicant! Let's look at the odds ratios to help w/ interpretation, divided by 100 to interpret as percents:
+
+```{r Get OR and confint for OR}
+exp(coef(mod1)/100) # OR
+exp(confint(mod1, level=0.95)/100) # OR CI
+```
+
+A ~4% increase in median proportion of time spent on phone away from home corresponded with higher odds of endorsing higher anxiety levels, while for a fixed median proportion of phone use away from home, an increase of 1-year decreased odds of endorsing higher anxiety levels by 2.5%.
+
+Let's visualize the significant associations in the model by splitting into quartiles for phone use not at home. We see that <0.02462 marks the 0-25th quantiles and >0.14874 marks the 75-100th quantiles.
+```{r quantile check}
+# quantiles for phone use not home - low is <0.02462 (25th), high is >0.14874 (75th)
+summary(all_data_comp2$median_phoneuse_nothome)
+```
+
+
+```{r get predicted probs and plot}
+# get probabilities of each anxiety score at values of <25th %ile phone use
+eff_low = effect(c('time','median_phoneuse_nothome'),mod=mod1, xlevels=list(time=c(0,1,2),
+             median_phoneuse_nothome=seq(from=0,to=0.02462,length=1000)))
+eff_df_low = cbind(eff_low$x, eff_low$prob)
+eff_df_low$wave = ifelse(eff_df_low$time>=2, 4, ifelse(eff_df_low$time<1, 2, 3))
+
+# get probabilities of each anxiety score at values of <75th %ile phone use
+eff_high = effect(c('time','median_phoneuse_nothome'),mod=mod1, xlevels=list(time=c(0,1,2),
+             median_phoneuse_nothome=seq(from=0.14874,to=0.58845,length=1000)))
+eff_df_high = cbind(eff_high$x, eff_high$prob)
+eff_df_high$wave = ifelse(eff_df_high$time>=2, 4, ifelse(eff_df_high$time<1, 2, 3))
+
+# generate data for plotting - calculate per-wave means for probabilites
+xl = eff_df_low %>% 
+  group_by(wave) %>% 
+  summarise(across(prob.X0:prob.X3, mean, .names = "mean_{.col}")) %>% 
+  gather(key=variable, value=value, -wave, convert=TRUE, factor_key=TRUE) %>% 
+  mutate(variable = factor(variable, levels = rev(levels(as.factor(variable)))))
+
+xh = eff_df_high %>% 
+  group_by(wave) %>% 
+  summarise(across(prob.X0:prob.X3, mean, .names = "mean_{.col}")) %>% 
+  gather(key=variable, value=value, -wave, convert=TRUE, factor_key=TRUE) %>% 
+  mutate(variable = factor(variable, levels = rev(levels(as.factor(variable)))))
+
+# merge data for plotting
+xl$type = 'Low Phone Use (<25th percentile)'; xh$type = 'High Phone Use (>75th percentile)'
+all_x = rbind(xl,xh)
+
+# create stacked bar plot
+ggplot(all_x,aes(x = wave, y = value, fill = variable)) + 
+  geom_bar(stat = "identity", position = 'stack') + # position_stack(reverse = TRUE)
+  labs(fill = "Anxiety Level") + ylab("Predicted Probability") + xlab("Time (Year of Study)") + 
+  scale_fill_manual(labels = c("5-6", "3-4", "1-2", "0"),
+                      values = brewer.pal(4,"YlGnBu"))+
+                    # values = c("#FFEFCC","#A1DAB4","#41B6C4","#225EA8")) + # YlGnBu
+  geom_text(aes(label = paste0(round(value * 100), "%")),
+            position = position_stack(vjust = 0.5),
+            color = "black",
+            size = 3) +
+  facet_grid(rows=vars(type)) 
+```
+
+We can clearly see that for individuals on the higher end of phone use away from home (>75th quantile), more reported >3 anxiety score in waves 2-3, but over the course of each wave, more reported anxiety score=0!
+
+\newpage
+
+## 5. Appendix:
+
+Supplementary analyses not included in/relevant to main paper are included here:
+
+Note that the location dataset has two variables for time spent at home, timeathome and hometime. We proceed with timeathome in our analysis and describe our justification in the paper. Here, we conduct some exploration of the two variables:
+
+```{r analysis of hometime vs timeathome}
+summary(phone_loc_all$timeathome) # shouldn't exceed 1440
+summary(phone_loc_all$hometime) # shouldn't exceed 1440
+plot(phone_loc_all$timeathome, phone_loc_all$hometime)
+
+rcorr(phone_loc_all$hometime,phone_loc_all$timeathome)
+summary(phone_loc_all$hometime-phone_loc_all$timeathome)
+sum(is.na(phone_loc_all$hometime))   # more NAs
+sum(is.na(phone_loc_all$timeathome)) # fewer NAs
+
+boxplot(phone_loc_all$timeathome, horizontal=T,
+        xlab="timeathome") # no outliers!
+```
+
+Below are calculations for various correlation metrics between the predictor variables and anxiety levels not included in the final paper due to interpretability concerns. They are left here for the interested reader.
+
+```{r correlations}
+## spearman correlations ##
+cor.test(all_data_comp2$median_phoneuse_home,as.numeric(all_data_comp2$phq4_anxiety_EMA), method = 'spearman')
+cor.test(all_data_comp2$median_phoneuse_nothome,as.numeric(all_data_comp2$phq4_anxiety_EMA), method = 'spearman')
+cor.test(all_data_comp2$median_phoneuse_total,as.numeric(all_data_comp2$phq4_anxiety_EMA),method='spearman')
+
+## repeated measures correlations ##
+rmcorr::rmcorr(new_id,median_phoneuse_home,as.numeric(phq4_anxiety_EMA),all_data_comp2)
+rmcorr::rmcorr(new_id,median_phoneuse_nothome,as.numeric(phq4_anxiety_EMA),all_data_comp2)
+rmcorr::rmcorr(new_id,median_phoneuse_total,as.numeric(phq4_anxiety_EMA),all_data_comp2)
+
+# anxiety and time outside home
+rmcorr::rmcorr(new_id,median_nottimeathome,as.numeric(phq4_anxiety_EMA),all_data_comp2)
+rmcorr::rmcorr(new_id,median_timeathome,as.numeric(phq4_anxiety_EMA),all_data_comp2)
+
+## polyserial correlation ## 
+#  polyserial correlation used for one continuous variable and one ordinal variable
+polyserial(x=all_data_comp2$median_phoneuse_home, y=all_data_comp2$phq4_anxiety_EMA)
+polyserial(x=all_data_comp2$median_phoneuse_nothome, y=all_data_comp2$phq4_anxiety_EMA)
+polyserial(x=all_data_comp2$median_phoneuse_total, y=all_data_comp2$phq4_anxiety_EMA)
+# polyserial(x=all_data_comp$median_timeathome, y=all_data_comp$phq4_anxiety_EMA)
+# polyserial(x=all_data_comp$time, y=all_data_comp$phq4_anxiety_EMA)
+
+
+## estimating repeated-measures spearman ##
+# i=0
+# for (id in unique(all_data_comp$new_id)) {
+#   subdat = all_data_comp[all_data_comp$pid==id,]
+#   sprmn = cor(subdat$median_phoneuse_home,as.numeric(subdat$phq4_anxiety_EMA))
+# }
+
+## some individuals only have one level of anxiety for all time, so can't calculate
+## correlation for them
+```
+
+
+We can make another version of the effects plot but visualize the four quartiles of phone use away from home (i.e., 0-25, 25-50, 50-75, 75-100) instead of just 0-25 and 75-100. This is left here for the interested reader.
+
+```{r}
+eff_l1 = effect(c('time','median_phoneuse_nothome'),mod=mod1, xlevels=list(time=c(0,1,2),
+             median_phoneuse_nothome=seq(from=0.02462,to=0.08880,length=1000)))
+eff_df_l1 = cbind(eff_l1$x, eff_l1$prob)
+eff_df_l1$wave = ifelse(eff_df_l1$time>=2, 4, ifelse(eff_df_l1$time<1, 2, 3))
+
+eff_h1 = effect(c('time','median_phoneuse_nothome'),mod=mod1, xlevels=list(time=c(0,1,2),
+             median_phoneuse_nothome=seq(from=0.08880,to=0.14866,length=1000)))
+eff_df_h1 = cbind(eff_h1$x, eff_h1$prob)
+eff_df_h1$wave = ifelse(eff_df_h1$time>=2, 4, ifelse(eff_df_h1$time<1, 2, 3))
+
+xl1 = eff_df_l1 %>% 
+  group_by(wave) %>% 
+  summarise(across(prob.X0:prob.X3, mean, .names = "mean_{.col}")) %>% 
+  gather(key=variable, value=value, -wave, convert=TRUE, factor_key=TRUE) %>% 
+  mutate(variable = factor(variable, levels = rev(levels(as.factor(variable)))))
+
+xh1 = eff_df_h1 %>% 
+  group_by(wave) %>% 
+  summarise(across(prob.X0:prob.X3, mean, .names = "mean_{.col}")) %>% 
+  gather(key=variable, value=value, -wave, convert=TRUE, factor_key=TRUE) %>% 
+  mutate(variable = factor(variable, levels = rev(levels(as.factor(variable)))))
+
+xl1$type = 'Mid-low Phone Use (25-50th percentile)'; xh1$type = 'Mid-high Phone Use (50-75th percentile)'
+
+all_x = rbind(xl1,xh,xh1,xl)
+all_x$type = factor(all_x$type, levels=c('Low Phone Use (<25th percentile)', 'Mid-low Phone Use (25-50th percentile)', 'Mid-high Phone Use (50-75th percentile)', 'High Phone Use (>75th percentile)'))
+
+ggplot(all_x,aes(x = wave, y = value, fill = variable)) + 
+  geom_bar(stat = "identity", position = 'stack') + # position_stack(reverse = TRUE)
+  labs(fill = "Anxiety Level") + ylab("Predicted Probability") + xlab("Time (Year of Study)") + 
+  scale_fill_manual(labels = c("6", "5", "4", "3", "2", "1", "0"),
+                      values = brewer.pal(7,"YlGnBu")) + # Blues
+  facet_wrap(~type, nrow = 2)
+```
+
